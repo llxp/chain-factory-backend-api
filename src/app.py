@@ -12,11 +12,11 @@ from .login_api.login_api import \
 application = Flask(__name__)
 application.config['SECRET_KEY'] = 'SECRET'
 application.config['MONGODB_SETTINGS'] = {
-    'host': 'mongodb://root:example@mongodb.dws.local/orchestrator_db?authSource=admin',
+    'host': 'mongodb://root:example@mongodb.ad.local/orchestrator_db?authSource=admin',
     'db': 'orchestrator_db'
 }
 application.config['MONGOALCHEMY_CONNECTION_STRING'] = \
-    'mongodb://root:example@mongodb.dws.local/orchestrator_db?authSource=admin'
+    'mongodb://root:example@mongodb.ad.local/orchestrator_db?authSource=admin'
 application.config['MONGOALCHEMY_DATABASE'] = 'orchestrator_db'
 
 cors = CORS(application)
