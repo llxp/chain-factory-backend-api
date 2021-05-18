@@ -1,0 +1,6 @@
+[submodule "src/login_api"]
+	path = src/login_api
+	url = https://github.com/llxp/login-api-flask.git
+[submodule "src/framework"]
+	path = src/framework
+	url = https://github.com/llxp/chain-factory-framework
