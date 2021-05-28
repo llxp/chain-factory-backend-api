@@ -1,5 +1,6 @@
 from flask import Flask
 import os
+import sys
 from flask_cors import CORS
 
 from .api import app as api
@@ -8,15 +9,17 @@ from .login_api.login_api import \
     init_app as ial
 
 
+print('initializing', file=sys.stderr)
+
 # create the flask application object
 application = Flask(__name__)
 application.config['SECRET_KEY'] = 'SECRET'
 application.config['MONGODB_SETTINGS'] = {
-    'host': 'mongodb://root:example@mongodb.ad.local/orchestrator_db?authSource=admin',
+    'host': 'mongodb://root:example@mongodb/orchestrator_db?authSource=admin',
     'db': 'orchestrator_db'
 }
 application.config['MONGOALCHEMY_CONNECTION_STRING'] = \
-    'mongodb://root:example@mongodb.ad.local/orchestrator_db?authSource=admin'
+    'mongodb://root:example@mongodb/orchestrator_db?authSource=admin'
 application.config['MONGOALCHEMY_DATABASE'] = 'orchestrator_db'
 
 cors = CORS(application)
