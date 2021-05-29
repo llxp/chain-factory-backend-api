@@ -15,7 +15,7 @@ print('initializing', file=sys.stderr)
 application = Flask(__name__)
 application.config['SECRET_KEY'] = os.getenv('APP_SECRET', 'SECRET')
 mongodb_connection: str = os.getenv('MONGODB_CONNECTION_URI', 'mongodb://root:example@mongodb/orchestrator_db?authSource=admin')
-mongodb_db: str = os.getenvc('MONGODB_DB', 'orchestrator_db')
+mongodb_db: str = os.getenv('MONGODB_DB', 'orchestrator_db')
 application.config['MONGODB_SETTINGS'] = {
     'host': mongodb_connection,
     'db': mongodb_db
