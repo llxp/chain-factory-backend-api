@@ -3,18 +3,10 @@ from flask_cors import cross_origin
 import json
 import os
 import pytz
-import requests
-import uuid
 import sys
 import traceback
 from typing import List
-from datetime import datetime, timedelta
-from functools import wraps
-import jwt
-from jwt import \
-    DecodeError, MissingRequiredClaimError, \
-    InvalidIssuedAtError, ImmatureSignatureError, \
-    ExpiredSignatureError
+from datetime import datetime
 
 # wrappers
 from .framework.src.task_queue.wrapper.amqp import AMQP
@@ -22,18 +14,22 @@ from .framework.src.task_queue.wrapper.redis_client import RedisClient
 from .framework.src.task_queue.wrapper.mongodb_client import MongoDBClient
 # settings
 from .framework.src.task_queue.common.settings import \
-    workflow_status_redis_key, task_log_status_redis_key, \
+    workflow_status_redis_key, \
     task_status_redis_key, \
-    heartbeat_redis_key, heartbeat_sleep_time
+    heartbeat_redis_key, heartbeat_sleep_time, \
+    task_log_status_redis_key
 # mongodb models
 from .framework.src.task_queue.models.mongo.workflow_log import WorkflowLog
 from .framework.src.task_queue.models.mongo.task import Task
 # redis models
-from .framework.src.task_queue.models.redis.workflow_status import WorkflowStatus
-from .framework.src.task_queue.models.redis.task_log_status import TaskLogStatus
+from .framework.src.task_queue.models.redis.workflow_status \
+    import WorkflowStatus
 from .framework.src.task_queue.models.redis.heartbeat import Heartbeat
 from .framework.src.task_queue.models.redis.task_status import TaskStatus
-from .framework.src.task_queue.models.redis.task_control_message import TaskControlMessage
+from .framework.src.task_queue.models.redis.task_control_message \
+    import TaskControlMessage
+from .framework.src.task_queue.models.redis.task_log_status \
+    import TaskLogStatus
 
 # login api
 from .login_api.login_api import roles_required
@@ -273,6 +269,19 @@ def abort_workflow(workflow_id: str):
         TaskControlMessage(
             workflow_id=workflow_id,
             command='abort'
+        ).to_json())
+    return json.dumps('OK'), 200
+
+
+@app.route('/stop_node/<string:node_name>', methods=['POST'])
+@cross_origin()
+@roles_required(roles=['NODE_ADMIN'])
+def stop_node(node_name: str):
+    redis_client.publish(
+        'node_control_channel',
+        TaskControlMessage(
+            workflow_id=node_name,
+            command='stop'
         ).to_json())
     return json.dumps('OK'), 200
 
