@@ -9,26 +9,26 @@ from typing import List
 from datetime import datetime
 
 # wrappers
-from .framework.src.task_queue.wrapper.amqp import AMQP
-from .framework.src.task_queue.wrapper.redis_client import RedisClient
-from .framework.src.task_queue.wrapper.mongodb_client import MongoDBClient
+from .framework.src.chain_factory.task_queue.wrapper.amqp import AMQP
+from .framework.src.chain_factory.task_queue.wrapper.redis_client import RedisClient
+from .framework.src.chain_factory.task_queue.wrapper.mongodb_client import MongoDBClient
 # settings
-from .framework.src.task_queue.common.settings import \
+from .framework.src.chain_factory.task_queue.common.settings import \
     workflow_status_redis_key, \
     task_status_redis_key, \
     heartbeat_redis_key, heartbeat_sleep_time, \
-    task_log_status_redis_key
+    task_status_redis_key
 # mongodb models
-from .framework.src.task_queue.models.mongo.workflow_log import WorkflowLog
-from .framework.src.task_queue.models.mongo.task import Task
+from .framework.src.chain_factory.task_queue.models.mongo.workflow_log import WorkflowLog
+from .framework.src.chain_factory.task_queue.models.mongo.task import Task
 # redis models
-from .framework.src.task_queue.models.redis.workflow_status \
+from .framework.src.chain_factory.task_queue.models.redis.workflow_status \
     import WorkflowStatus
-from .framework.src.task_queue.models.redis.heartbeat import Heartbeat
-from .framework.src.task_queue.models.redis.task_status import TaskStatus
-from .framework.src.task_queue.models.redis.task_control_message \
+from .framework.src.chain_factory.task_queue.models.redis.heartbeat import Heartbeat
+from .framework.src.chain_factory.task_queue.models.redis.task_status import TaskStatus
+from .framework.src.chain_factory.task_queue.models.redis.task_control_message \
     import TaskControlMessage
-from .framework.src.task_queue.models.redis.task_log_status \
+from .framework.src.chain_factory.task_queue.models.redis.task_log_status \
     import TaskLogStatus
 
 # login api
@@ -39,15 +39,15 @@ app = Blueprint(
     'api',
     __name__)
 
-redis_host = os.getenv('REDIS_HOST', '192.168.6.1')
-rabbitmq_host = os.getenv('RABBITMQ_HOST', '192.168.6.1')
+redis_host = os.getenv('REDIS_HOST', '172.16.19.15')
+rabbitmq_host = os.getenv('RABBITMQ_HOST', '172.16.19.15')
 rabbitmq_user = os.getenv('RABBITMQ_USER', 'guest')
 rabbitmq_password = os.getenv('RABBITMQ_PASSWORD', 'guest')
 authentication_api_host = \
-    os.getenv('AUTHENTICATION_API_HOST', 'http://192.168.6.1:8083')
+    os.getenv('AUTHENTICATION_API_HOST', 'http://172.16.19.15:8083')
 mongodb_uri = os.getenv(
     'MONGODB_CONNECTION_URI',
-    'mongodb://root:example@192.168.6.1/orchestrator_db?authSource=admin'
+    'mongodb://root:example@172.16.19.15/orchestrator_db?authSource=admin'
 )
 
 redis_client: RedisClient = RedisClient(redis_host)
@@ -56,15 +56,27 @@ amqp_client = AMQP(
     queue_name='task_queue',
     username=rabbitmq_user,
     password=rabbitmq_password,
-    amqp_type='publisher'
+    amqp_type='publisher',
+    virtual_host="root"
 )
 mongodb_client = MongoDBClient(mongodb_uri)
 
 
-@app.route('/task_log/<string:task_id>')
+def get_amqp_client(namespace: str):
+    return AMQP(
+        host=rabbitmq_host,
+        queue_name=namespace + '_' + 'task_queue',
+        username=rabbitmq_user,
+        password=rabbitmq_password,
+        amqp_type='publisher',
+        virtual_host=namespace
+    )
+
+
+@app.route('/task_log/<string:namespace>/<string:task_id>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def task_log(task_id: str):
+def task_log(namespace: str, task_id: str):
     return json.dumps(
         [
             task
@@ -76,10 +88,10 @@ def task_log(task_id: str):
     )
 
 
-@app.route('/workflow_status/<string:workflow_id>')
+@app.route('/workflow_status/<string:namespace>/<string:workflow_id>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def workflow_status(workflow_id: str):
+def workflow_status(namespace: str, workflow_id: str):
     workflow_status_len = redis_client.llen(workflow_status_redis_key)
     for i in range(0, workflow_status_len):
         list_obj: WorkflowStatus = redis_client.lindex_obj(
@@ -93,10 +105,10 @@ def workflow_status(workflow_id: str):
 
 
 def task_status(task_id: str):
-    task_status_len = redis_client.llen(task_log_status_redis_key)
+    task_status_len = redis_client.llen(task_status_redis_key)
     for i in range(0, task_status_len):
         list_obj: TaskLogStatus = redis_client.lindex_obj(
-            task_log_status_redis_key, i, TaskLogStatus)
+            task_status_redis_key, i, TaskLogStatus)
         if (
             list_obj is not None and
             list_obj.task_id == task_id
@@ -105,10 +117,10 @@ def task_status(task_id: str):
     return 0
 
 
-@app.route('/workflow_details/<string:workflow_id>')
+@app.route('/workflow_details/<string:namespace>/<string:workflow_id>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def workflow_details(workflow_id: str):
+def workflow_details(namespace: str, workflow_id: str):
     return Task.schema().dumps(workflow_tasks(workflow_id))
 
 
@@ -123,10 +135,10 @@ def workflow_tasks(workflow_id: str):
     return task_ids
 
 
-@app.route('/workflow_log/<string:workflow_id>')
+@app.route('/workflow_log/<string:namespace>/<string:workflow_id>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def workflow_log(workflow_id: str):
+def workflow_log(namespace: str, workflow_id: str):
     workflow_log = []
     task_ids: List[Task] = workflow_tasks(workflow_id)
     for task in task_ids:
@@ -146,10 +158,10 @@ def workflow_log(workflow_id: str):
     return WorkflowLog.schema().dumps(workflow_log, many=True)
 
 
-@app.route('/task_details/<string:task_id>')
+@app.route('/task_details/<string:namespace>/<string:task_id>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def task_details(task_id: str):
+def task_details(namespace: str, task_id: str):
     task = mongodb_client.db().tasks.find_one({'task.task_id': task_id})
     filtered_task = {
         task_key: task[task_key] for task_key in task if task_key != '_id'
@@ -159,10 +171,10 @@ def task_details(task_id: str):
         else (json.dumps(''), 404)
 
 
-@app.route('/new_task/<string:node_name>/<string:task>', methods=['POST'])
+@app.route('/new_task/<string:namespace>/<string:node_name>/<string:task>', methods=['POST'])
 @cross_origin()
 @roles_required(roles=['USER'])
-def new_task(task: str, node_name: str):
+def new_task(namespace: str, task: str, node_name: str):
     json_body = request.json
     if 'tags' in json_body:
         tags = json_body['tags']
@@ -173,12 +185,14 @@ def new_task(task: str, node_name: str):
     else:
         arguments = None
     if node_name == 'default':
+        amqp_client = get_amqp_client(namespace)
         amqp_client.send(
             Task(
                 name=task,
                 arguments=arguments,
                 tags=tags
             ).to_json())
+        amqp_client.close()
     else:
         new_task: Task = Task(
             name=task,
@@ -191,10 +205,10 @@ def new_task(task: str, node_name: str):
     return json.dumps('OK'), 200
 
 
-@app.route('/available_tasks')
+@app.route('/available_tasks/<string:namespace>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def tasks():
+def tasks(namespace: str):
     return json.dumps([
         {
             task_key: task[task_key] for task_key in task if task_key != '_id'
@@ -203,10 +217,10 @@ def tasks():
     ]), 200
 
 
-@app.route('/workflow_history_count/<string:node_name>')
+@app.route('/workflow_history_count/<string:namespace>/<string:node_name>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def workflow_history_count(node_name: str):
+def workflow_history_count(namespace: str, node_name: str):
     return json.dumps(
         mongodb_client.db().workflows.count()
         if node_name == 'default'
@@ -218,10 +232,10 @@ def workflow_history_count(node_name: str):
     ), 200
 
 
-@app.route('/workflow_history/<string:node_name>/<int:begin>/<int:end>')
+@app.route('/workflow_history/<string:namespace>/<string:node_name>/<int:begin>/<int:end>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def workflow_history(node_name: str, begin: int, end: int):
+def workflow_history(namespace: str, node_name: str, begin: int, end: int):
     return json.dumps(
         [
             {
@@ -247,7 +261,7 @@ def workflow_history(node_name: str, begin: int, end: int):
     )
 
 
-@app.route('/stop_workflow/<string:workflow_id>', methods=['POST'])
+@app.route('/stop_workflow/<string:namespace>/<string:workflow_id>', methods=['POST'])
 @cross_origin()
 @roles_required(roles=['USER'])
 def stop_workflow(workflow_id: str):
@@ -260,7 +274,7 @@ def stop_workflow(workflow_id: str):
     return json.dumps('OK'), 200
 
 
-@app.route('/abort_workflow/<string:workflow_id>', methods=['POST'])
+@app.route('/abort_workflow/<string:namespace>/<string:workflow_id>', methods=['POST'])
 @cross_origin()
 @roles_required(roles=['USER'])
 def abort_workflow(workflow_id: str):
@@ -273,12 +287,12 @@ def abort_workflow(workflow_id: str):
     return json.dumps('OK'), 200
 
 
-@app.route('/stop_node/<string:node_name>', methods=['POST'])
+@app.route('/stop_node/<string:namespace>/<string:node_name>', methods=['POST'])
 @cross_origin()
 @roles_required(roles=['NODE_ADMIN'])
-def stop_node(node_name: str):
+def stop_node(namespace: str, node_name: str):
     redis_client.publish(
-        'node_control_channel',
+        namespace + '_' + 'node_control_channel',
         TaskControlMessage(
             workflow_id=node_name,
             command='stop'
@@ -286,10 +300,10 @@ def stop_node(node_name: str):
     return json.dumps('OK'), 200
 
 
-@app.route('/task_metrics/<string:begin>/<string:end>')
+@app.route('/task_metrics/<string:namespace>/<string:begin>/<string:end>')
 @cross_origin()
 @roles_required(roles=['USER'])
-def task_metrics(begin: str, end: str):
+def task_metrics(namespace: str, begin: str, end: str):
     task_status_length = redis_client.llen(task_status_redis_key)
     metrics: List[str] = []
     for i in range(0, task_status_length):
@@ -318,7 +332,7 @@ def task_metrics(begin: str, end: str):
     return json.dumps(metrics), 200
 
 
-@app.route('/all_nodes')
+@app.route('/all_nodes/<string:namespace>')
 @cross_origin()
 @roles_required(roles=['USER'])
 def node_names():
@@ -334,7 +348,7 @@ def node_names():
     )
 
 
-@app.route('/active_nodes')
+@app.route('/active_nodes/<string:namespace>')
 @cross_origin()
 @roles_required(roles=['USER'])
 def nodes():
@@ -357,3 +371,19 @@ def nodes():
                 if diff.total_seconds() <= heartbeat_sleep_time * 2:
                     node_list.append(node_name['node_name'])
     return json.dumps(node_list)
+
+
+@app.route('/tasks_with_tag/<string:namespace>/<string:tag>')
+@cross_origin()
+@roles_required(roles=['USER'])
+def tasks_with_tags(tag: str):
+    return json.dumps(
+        [
+            {
+                task_key: workflow[task_key]
+                for task_key in workflow if task_key != '_id'
+            }
+            for workflow in
+            mongodb_client.db().tasks.find({})
+        ]
+    )
