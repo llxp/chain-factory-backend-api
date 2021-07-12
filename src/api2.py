@@ -23,13 +23,6 @@ from orchestrator_api.api import app as orchestrator_app
 app = FastAPI()
 
 origins = [
-    "http://192.168.2.105:3000",
-    "http://backend-api.dws.local",
-    "https://backend-api.dws.local",
-    "http://web-ui.dws.local",
-    "https://web-ui.dws.local",
-    "http://chainfactory.dws.local",
-    "https://chainfactory.dws.local",
     "http://backend-api.ad.lan",
     "https://backend-api.ad.lan",
     "http://web-ui.ad.lan",
@@ -57,7 +50,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-host = "192.168.6.1"
+host = "127.0.0.1"
 rabbitmq_host = os.getenv("RABBITMQ_HOST", host)
 rabbitmq_user = os.getenv("RABBITMQ_USER", "guest")
 rabbitmq_password = os.getenv("RABBITMQ_PASSWORD", "guest")
