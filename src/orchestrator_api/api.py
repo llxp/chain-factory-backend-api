@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Request
 import json
-from fastapi.param_functions import Body
+from fastapi.param_functions import Body, Query
 from pydantic.main import BaseModel
 import pytz
 import requests
@@ -404,6 +404,34 @@ async def workflows(
                 }
             },
             {
+                '$lookup': {
+                    'from': 'workflow_status',
+                    'localField': 'workflow_id',
+                    'foreignField': 'workflow_id',
+                    'as': 'status'
+                }
+            },
+            {
+                '$project': {
+                    'tasks': 1,
+                    'tags': 1,
+                    'namespace': 1,
+                    'workflow_id': 1,
+                    'created_date': 1,
+                    'status': {
+                        '$ifNull': [
+                            {'$first': '$status.status' },
+                            'Running'
+                        ]
+                    },
+                }
+            },
+            {
+                '$project': {
+                    'status._id': 0,
+                }
+            },
+            {
                 "$facet": {
                     "workflows": [
                         stage2
@@ -621,22 +649,29 @@ async def workflow_tasks(
     return (await log_result.to_list(1))[0]
 
 
-@app.get('/workflow_status')
+@app.get('/workflow_status', dependencies=[user_role])
 async def workflow_status(
-    workflow_id: str,
     request: Request,
+    workflow_id: List[str] = Query([]),
 ):
+    def match_stage():
+        stage = {
+            '$match': {}
+        }
+        if isinstance(workflow_id, str):
+            stage["$match"]['workflow_id'] = workflow_id
+        elif isinstance(workflow_id, list):
+            stage["$match"]['workflow_id'] = {
+                '$in': workflow_id
+            }
+        return stage
     log_result = request.state.database.workflows.aggregate([
         # {
         #     '$project': {
         #         '_id': 0,
         #     }
         # },
-        {
-            '$match': {
-                'workflow_id': workflow_id
-            }
-        },
+        match_stage(),
         {
             '$lookup': {
                 'from': 'workflow_status',
@@ -716,4 +751,58 @@ async def workflow_status(
             }
         }
     ])
-    return (await log_result.to_list(1))
+    return (await log_result.to_list(None))
+
+
+@app.post('/stop_workflow', dependencies=[Depends(RolesRequiredChecker(roles=["WORKFLOW_CONTROLLER"]))])
+async def stop_workflow(namespace: str, workflow_id: str, request: Request):
+    request.state.redis_client.publish(
+        namespace + '_' + task_control_channel_redis_key,
+        TaskControlMessage(
+            workflow_id=workflow_id,
+            command='stop'
+        ).to_json())
+    workflow_status = request.state.database.workflow_status
+    if not (
+        await workflow_status.find_one({
+            'workflow_id': workflow_id,
+            'namespace': namespace
+        })
+    ):
+        await workflow_status.insert_one({
+            'workflow_id': workflow_id,
+            'namespace': namespace,
+            'status': 'Stopped',
+            'created_date': datetime.now(pytz.UTC)
+        })
+    return 'OK'
+
+
+@app.post('/abort_workflow', dependencies=[Depends(RolesRequiredChecker(roles=["WORKFLOW_CONTROLLER"]))])
+async def abort_workflow(namespace: str, workflow_id: str, request: Request):
+    request.state.redis_client.publish(
+        namespace + '_' + task_control_channel_redis_key,
+        TaskControlMessage(
+            workflow_id=workflow_id,
+            command='abort'
+        ).to_json())
+    workflow_status = request.state.database.workflow_status
+    if not (
+        await workflow_status.find_one(
+            {'workflow_id': workflow_id, 'namespace': namespace}
+        )
+    ):
+        print('workflow_id: ' + workflow_id + ' found')
+        await workflow_status.insert_one({'workflow_id': workflow_id, 'namespace': namespace, 'status': 'Stopped'})
+    return 'OK'
+
+
+@app.post('/stop_node', dependencies=[Depends(RolesRequiredChecker(roles=["NODE_ADMIN"]))])
+def stop_node(namespace: str, node_name: str, request: Request):
+    request.state.redis_client.publish(
+        namespace + '_' + 'node_control_channel',
+        TaskControlMessage(
+            workflow_id=node_name,
+            command='stop'
+        ).to_json())
+    return 'OK'
