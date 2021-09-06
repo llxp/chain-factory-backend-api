@@ -1,51 +1,117 @@
 from fastapi import APIRouter, Depends, Request
-import json
 from fastapi.param_functions import Body, Query
 from pydantic.main import BaseModel
 import pytz
-import requests
-import sys
-import traceback
 import bson
 from typing import List, Optional
 from datetime import datetime
-from jose import jwe
 import re
+import time
+# import json
 
 # wrappers
 from framework.src.chain_factory.task_queue.wrapper.amqp import AMQP
-from framework.src.chain_factory.task_queue.wrapper.redis_client import RedisClient
 
 # settings
 from framework.src.chain_factory.task_queue.common.settings import (
-    workflow_status_redis_key,
-    task_status_redis_key,
     heartbeat_redis_key,
     heartbeat_sleep_time,
-    task_status_redis_key,
     task_control_channel_redis_key,
 )
 
 # mongodb models
-from framework.src.chain_factory.task_queue.models.mongo.workflow_log import WorkflowLog
 from framework.src.chain_factory.task_queue.models.mongo.task import Task
 
 # redis models
-from framework.src.chain_factory.task_queue.models.redis.workflow_status import (
-    WorkflowStatus,
-)
-from framework.src.chain_factory.task_queue.models.redis.heartbeat import Heartbeat
-from framework.src.chain_factory.task_queue.models.redis.task_status import TaskStatus
-from framework.src.chain_factory.task_queue.models.redis.task_control_message import (
-    TaskControlMessage,
-)
-from framework.src.chain_factory.task_queue.models.redis.task_log_status import (
-    TaskLogStatus,
-)
+from framework.src.chain_factory.task_queue.models.redis.heartbeat import \
+    Heartbeat
+from framework.src.chain_factory.task_queue.models.redis.task_control_message \
+    import (
+        TaskControlMessage,
+    )
 
 from login_api.login_api2 import (
     RolesRequiredChecker,
 )
+
+
+def default_namespace(namespace):
+    return namespace == "default" or namespace == "all"
+
+
+def has_pagination(page, page_size):
+    return page is not None and page_size is not None
+
+
+def get_page_size(page_size):
+    return page_size if page_size > 0 else 1
+
+
+def skip_stage(page, page_size):
+    stage = {}
+    if has_pagination(page, page_size):
+        stage["$skip"] = page * get_page_size(page_size)
+    return stage
+
+
+def limit_stage(page, page_size):
+    stage = {}
+    if has_pagination(page, page_size):
+        stage["$limit"] = get_page_size(page_size)
+    return stage
+
+
+def sort_stage(sort_by, sort_order):
+    stage = {}
+    sortable_fields = [
+        'created_date',
+        'entry_task.name',
+        'workflow.workflow_id',
+        'workflow.namespace',
+        'workflow.tags'
+    ]
+    if sort_by in sortable_fields and sort_order in ["asc", "desc"]:
+        stage['$sort'] = {
+            sort_by: 1 if sort_order == 'asc' else -1
+        }
+    return stage
+
+
+def lookup(from_: str, local_field: str, foreign_field: str, as_: str):
+    return {
+        '$lookup': {
+            'from': from_,
+            'localField': local_field,
+            'foreignField': foreign_field,
+            'as': as_
+        }
+    }
+
+
+def lookup_workflow_status(local_field: str, as_: str):
+    return lookup('workflow_status', local_field, 'workflow_id', as_)
+
+
+def lookup_logs(local_field: str, as_: str):
+    return lookup('logs', local_field, 'task_id', as_)
+
+
+def match(fields):
+    return {
+        "$match": fields
+    }
+
+
+def unwind(field):
+    return {
+        "$unwind": field
+    }
+
+
+def project(fields):
+    return {
+        "$project": fields
+    }
 
 
 def get_amqp_client(namespace: str, request: Request):
@@ -81,7 +147,9 @@ def new_task(
         for i in range(0, 1):
             amqp_client.send(
                 Task(
-                    name=task, arguments=json_body.arguments, tags=json_body.tags
+                    name=task,
+                    arguments=json_body.arguments,
+                    tags=json_body.tags
                 ).to_json()
             )
         amqp_client.close()
@@ -92,10 +160,8 @@ def new_task(
             node_names=[node_name],
             tags=json_body.tags,
         )
-        print("new_task: " + new_task.to_json())
         amqp_client = get_amqp_client(namespace, request)
-        for i in range(0, 20):
-            print(i)
+        for i in range(0, 1):
             amqp_client.send(new_task.to_json())
         amqp_client.close()
     return {"status": "OK"}
@@ -107,7 +173,8 @@ async def node_active(node_name: str, namespace: str, request: Request):
     if node_status_bytes is not None:
         node_status_string = node_status_bytes.decode("utf-8")
         if len(node_status_string) > 0:
-            heartbeat_status: Heartbeat = Heartbeat.from_json(node_status_string)
+            heartbeat_status: Heartbeat = Heartbeat.from_json(
+                node_status_string)
             last_time_seen = heartbeat_status.last_time_seen
             now = datetime.utcnow().replace(tzinfo=pytz.utc)
             diff = now - last_time_seen
@@ -119,17 +186,23 @@ async def node_active(node_name: str, namespace: str, request: Request):
 async def nodes(namespace: str, request: Request):
     node_list: List[str] = []
 
-    def search_query():
+    def match_namespace():
         query = {}
-        if namespace != "default":
+        if not default_namespace(namespace):
             query["namespace"] = namespace
         return query
 
     node_name_list = request.state.database.registered_tasks.find(
-        search_query(), {"node_name": 1, "_id": 0, "namespace": 1}
+        match_namespace(), {"node_name": 1, "_id": 0, "namespace": 1}
     )
     async for node_name in node_name_list:
-        if await node_active(node_name["node_name"], node_name["namespace"], request):
+        if (
+            await node_active(
+                node_name["node_name"],
+                node_name["namespace"],
+                request
+            )
+        ):
             node_list.append(node_name)
     return node_list
 
@@ -142,14 +215,14 @@ async def tasks(
     page_size: int = None,
     nodes=[],
 ):
-    unwind_stage = {"$unwind": "$tasks"}
+    unwind_stage = unwind("$tasks")
 
     def match_stage():
-        stage = {"$match": {}}
+        stage = match({})
         if search:
             rgx = bson.regex.Regex("^{}".format(search))
             stage["$match"] = {"tasks.name": {"$regex": rgx}}
-        if namespace != "default":
+        if not default_namespace(namespace):
             stage["$match"]["namespace"] = namespace
         if nodes or nodes is None:
             stage["$match"]["node_name"] = {
@@ -160,47 +233,37 @@ async def tasks(
             }
         return stage
 
-    def skip_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$skip"] = page * (page_size if page_size > 0 else 1)
-        return stage
-
-    def limit_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$limit"] = page_size if page_size > 0 else 1
-        return stage
-
     aggregate_query = [
         stage
         for stage in [
             match_stage(),
             unwind_stage,
             match_stage(),
-            {"$project": {"_id": 0}},
+            project({"_id": 0}),
             {
                 "$facet": {
                     "node_tasks": [
                         stage2
-                        for stage2 in [skip_stage(), limit_stage()]
+                        for stage2 in [
+                            skip_stage(page, page_size),
+                            limit_stage(page, page_size)
+                        ]
                         if stage2 != {}
                     ],
                     "total_count": [{"$count": "count"}],
                 }
             },
-            {
-                "$project": {
-                    "node_tasks": 1,
-                    "total_count": {"$first": "$total_count.count"},
-                }
-            },
+            project({
+                "node_tasks": 1,
+                "total_count": {"$first": "$total_count.count"},
+            }),
         ]
         if stage != {}
     ]
-    registered_tasks_result = request.state.database.registered_tasks.aggregate(
-        aggregate_query
-    )
+    registered_tasks_result = \
+        request.state.database.registered_tasks.aggregate(
+            aggregate_query
+        )
     registered_tasks = [tasks async for tasks in registered_tasks_result]
     return (
         registered_tasks[0]
@@ -217,6 +280,7 @@ async def active_tasks(
     page: Optional[int] = None,
     page_size: Optional[int] = None,
 ):
+    # time.sleep(0.5)
     active_nodes = await nodes(namespace, request)
     tasks_result = await tasks(
         namespace,
@@ -236,35 +300,28 @@ async def workflows(
     search: Optional[str] = None,
     page: Optional[int] = None,
     page_size: Optional[int] = None,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = None,
 ):
-    def skip_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage['$skip'] = (page * (page_size if page_size > 0 else 1))
-        return stage
-
-    def limit_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage['$limit'] = (page_size if page_size > 0 else 1)
-        return stage
+    # time.sleep(5)
 
     def search_stage():
         stages = []
-        stage = {
-            '$match': {
-                '$and': [
-                    {
-                        "namespace": { '$exists': 'true', '$nin': [ "", 'null' ] },
-                    }
-                ]
-            }
-        }
+        stage = match({
+            '$and': [
+                {
+                    "workflow.namespace": {
+                        '$exists': 'true',
+                        '$nin': ["", 'null']
+                    },
+                }
+            ]
+        })
         if search:
-            search_splitted1 = search.split(' ')
-            print(search_splitted1)
+            search_splitted = search.split(' ')
             patterns = []
             keys = []
+
             def get_regex(pattern):
                 regex = re.compile(pattern)
                 rgx = bson.regex.Regex.from_native(regex)
@@ -272,17 +329,20 @@ async def workflows(
                 return rgx
 
             operators = {
-                'name':{ 'type': 'str', 'key': 'tasks.name'},
-                'tags': { 'type': 'list', 'key': 'tasks.tags'},
-                'namespace': { 'type': 'str', 'key': 'namespace'},
-                'date': { 'type': 'str', 'key': 'created_date'},
-                'arguments': { 'type': 'dict', 'key': 'tasks.arguments'},
-                'logs': { 'type': 'logs', 'key': 'logs.log_line'}
+                'name': {'type': 'str', 'key': 'tasks.name'},
+                'tags': {'type': 'list', 'key': 'tasks.tags'},
+                'namespace': {'type': 'str', 'key': 'workflow.namespace'},
+                'date': {'type': 'str', 'key': 'created_date'},
+                'arguments': {'type': 'dict', 'key': 'tasks.arguments'},
+                'logs': {'type': 'logs', 'key': 'logs.log_line'}
             }
-            
+
             def get_operator(operator, value):
                 operator_obj = operators[operator]
-                if operator_obj['type'] == 'str' or operator_obj['type'] == 'list':
+                if (
+                    operator_obj['type'] == 'str' or
+                    operator_obj['type'] == 'list'
+                ):
                     return {
                         operator_obj['key']: {
                             '$regex': get_regex(value)
@@ -290,21 +350,22 @@ async def workflows(
                     }, None
                 elif operator_obj['type'] == 'dict':
                     splitted_map = value.split(':')
-                    print(splitted_map)
                     if len(splitted_map) >= 2:
                         joined_map = ''.join(splitted_map[1:])
                         splitted_map[1] = joined_map
                     if len(splitted_map) < 2:
-                        print('None')
                         return None, None
                     project_stage = {
                         '$addFields': {
                             '{}_string'.format(splitted_map[0]): {
                                 "$map": {
-                                    "input": "${}.{}".format(operator_obj['key'], splitted_map[0]),
+                                    "input": "${}.{}".format(
+                                        operator_obj['key'],
+                                        splitted_map[0]
+                                    ),
                                     "as": "row",
                                     "in": {
-                                        "value": { "$toString": '$$row'}
+                                        "value": {"$toString": '$$row'}
                                     }
                                 }
                             },
@@ -317,21 +378,16 @@ async def workflows(
                         }
                     }, '{}_string'.format(splitted_map[0])
                 elif operator_obj['type'] == 'logs':
-                    stages.append({
-                        '$lookup': {
-                            'from': 'logs',
-                            'localField': 'tasks.task_id',
-                            'foreignField': 'task_id',
-                            'as': 'logs'
-                        }
-                    })
+                    stages.append(
+                        lookup_logs('tasks.task_id', 'logs')
+                    )
                     return {
                         'logs.log_line': {
                             '$regex': get_regex(value)
                         }
                     }, 'logs'
                 return None, None
-            for search_pattern in search_splitted1:
+            for search_pattern in search_splitted:
                 if ':' in search_pattern:
                     tokens = search_pattern.split(':')
                     operator, value = tokens[0], ':'.join(tokens[1:])
@@ -345,115 +401,101 @@ async def workflows(
                     pattern_temp, key = get_operator('name', search_pattern)
                     if pattern_temp:
                         patterns.append(pattern_temp)
-            # rgx = bson.regex.Regex('{}'.format(search))
-            print(search)
-            print(patterns)
             if patterns:
                 stage['$match']['$and'].append({
                     '$and': patterns
                 })
-        if namespace and namespace != 'default':
+        if namespace and not default_namespace(namespace):
             stage['$match']['$and'].append({
-                'namespace': namespace
+                'workflow.namespace': namespace
             })
         stages.append(stage)
         if len(stages) >= 2:
-            stages.append({
-                '$project': {
-                    key: 0 for key in keys
-                }
-            })
+            stages.append(project({key: 0 for key in keys}))
         return stages
 
     pipeline = [
         stage for stage in [
             {
-                '$lookup': {
-                    'from': 'tasks',
-                    'localField': 'workflow_id',
-                    'foreignField': 'workflow_id',
-                    'as': 'tasks'
-                }
-            },
-            {
-                '$project': {
-                    '_id': 0,
-                    'tasks._id': 0,
-                    'tasks.task.workflow_id': 0,
-                    'tasks.workflow_id': 0,
-                    'tasks.node_name': 0
-                }
-            },
-            {
-                '$project': {
-                    'tasks': '$tasks.task',
-                    'tags': 1,
-                    'namespace': 1,
-                    'workflow_id': 1,
-                    'created_date': 1
-                }
-            },
-            *search_stage(),
-            {
-                '$project': {
-                    'tasks': [ {'$first': '$tasks'}],
-                    'tags': 1,
-                    'namespace': 1,
-                    'workflow_id': 1,
-                    'created_date': 1
-                }
-            },
-            {
-                '$lookup': {
-                    'from': 'workflow_status',
-                    'localField': 'workflow_id',
-                    'foreignField': 'workflow_id',
-                    'as': 'status'
-                }
-            },
-            {
-                '$project': {
-                    'tasks': 1,
-                    'tags': 1,
-                    'namespace': 1,
-                    'workflow_id': 1,
-                    'created_date': 1,
-                    'status': {
-                        '$ifNull': [
-                            {'$first': '$status.status' },
-                            'Running'
-                        ]
+                '$group': {
+                    '_id': {'workflow_id': '$workflow_id'},
+                    'workflow': {
+                        '$addToSet': {
+                            'workflow_id': '$workflow_id',
+                            'namespace': '$namespace',
+                            'tags': '$tags',
+                        },
                     },
+                    'created_dates': {
+                        '$push': '$created_date'
+                    }
                 }
             },
-            {
-                '$project': {
-                    'status._id': 0,
+            lookup('tasks', '_id.workflow_id', 'workflow_id', 'tasks'),
+            project({
+                '_id': 0,
+                'tasks._id': 0,
+                'tasks.task.workflow_id': 0,
+                'tasks.workflow_id': 0,
+                'tasks.node_name': 0
+            }),
+            project({
+                'tasks': '$tasks.task',
+                "workflow": {
+                    "$first": "$workflow"
+                },
+                'created_date': {
+                    '$first': '$created_dates'
                 }
-            },
+            }),
+            *search_stage(),
+            project({
+                'entry_task': {'$first': '$tasks'},
+                'workflow': 1,
+                'created_date': 1,
+            }),
+            lookup_workflow_status('workflow.workflow_id', 'status'),
+            project({
+                'entry_task': 1,
+                'workflow': 1,
+                'created_date': 1,
+                'status': {
+                    '$ifNull': [
+                        {'$first': '$status.status'},
+                        'Running'
+                    ]
+                },
+            }),
+            project({'status._id': 0}),
             {
                 "$facet": {
                     "workflows": [
                         stage2
-                        for stage2 in [skip_stage(), limit_stage()]
+                        for stage2 in [
+                            sort_stage(sort_by, sort_order),
+                            skip_stage(page, page_size),
+                            limit_stage(page, page_size)
+                        ]
                         if stage2 != {}
                     ],
                     "total_count": [{"$count": "count"}],
                 }
             },
-            {
-                "$project": {
-                    "workflows": 1,
-                    "total_count": {
-                        '$ifNull': [{"$first": "$total_count.count"}, 0 ]
-                    },
-                    'count': { '$size': '$workflows' }
-                }
-            }
+            project({
+                "workflows": 1,
+                "total_count": {
+                    '$ifNull': [{"$first": "$total_count.count"}, 0]
+                },
+                'count': {'$size': '$workflows'}
+            })
         ] if stage != {}
     ]
 
-    print(pipeline)
+    # print(json.dumps(
+    #     pipeline,
+    #     indent=4,
+    #     default=lambda o: '<not serializable>'
+    # ))
 
     workflow_tasks = request.state.database.workflows.aggregate(pipeline)
     return (await workflow_tasks.to_list(1))[0]
@@ -471,180 +513,115 @@ async def namespaces(request: Request):
     return namespaces_result
 
 
-@app.get('/task_logs')
+@app.get('/task_logs', dependencies=[user_role])
 async def task_log(
     task_id: str,
     request: Request,
     page: Optional[int] = None,
     page_size: Optional[int] = None,
 ):
-
-    def skip_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$skip"] = page * (page_size if page_size > 0 else 1)
-        return stage
-
-    def limit_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$limit"] = page_size if page_size > 0 else 1
-        return stage
-
     log_result = request.state.database.logs.aggregate([
-        {
-            '$match': {
-                'task_id': task_id
-            }
-        },
-        {
-            '$project': {
-                'log_line': 1,
-                '_id': 0,
-            }
-        },
+        match({'task_id': task_id}),
+        project({
+            'log_line': 1,
+            '_id': 0,
+        }),
         {
             "$facet": {
                 "log_lines": [
                     stage2
-                    for stage2 in [skip_stage(), limit_stage()]
+                    for stage2 in [
+                        skip_stage(page, page_size),
+                        limit_stage(page, page_size)
+                    ]
                     if stage2 != {}
                 ],
                 "total_count": [{"$count": "count"}],
             }
         },
-        {
-            '$project': {
-                'log_lines': '$log_lines.log_line',
-                'total_count': {
-                    '$first': '$total_count.count'
-                }
+        project({
+            'log_lines': '$log_lines.log_line',
+            'total_count': {
+                '$first': '$total_count.count'
             }
-        }
+        })
     ])
     return (await log_result.to_list(1))[0]
 
 
-@app.get('/workflow_logs')
+@app.get('/workflow_logs', dependencies=[user_role])
 async def workflow_logs(
     workflow_id: str,
     request: Request,
     page: Optional[int] = None,
     page_size: Optional[int] = None,
 ):
-
-    def skip_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$skip"] = page * (page_size if page_size > 0 else 1)
-        return stage
-
-    def limit_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$limit"] = page_size if page_size > 0 else 1
-        return stage
-
     log_result = request.state.database.tasks.aggregate([
-        {
-            '$lookup': {
-                'from': 'logs',
-                'localField': 'task.task_id',
-                'foreignField': 'task_id',
-                'as': 'logs'
-            }
-        },
-        {
-            '$project': {
-                '_id': 0,
-                'logs._id': 0,
-                'logs.task_id': 0,
-                'task.name': 0,
-                'task.arguments': 0
-            }
-        },
-        {
-            '$match': {
-                'workflow_id': workflow_id
-            }
-        },
-        {
-            '$project': {
-                'task_id': '$task.task_id',
-                'logs': '$logs.log_line'
-            }
-        },
+        lookup_logs('task.task_id', 'logs'),
+        project({
+            '_id': 0,
+            'logs._id': 0,
+            'logs.task_id': 0,
+            'task.name': 0,
+            'task.arguments': 0
+        }),
+        match({'workflow_id': workflow_id}),
+        project({
+            'task_id': '$task.task_id',
+            'logs': '$logs.log_line'
+        }),
         {
             "$facet": {
                 "task_logs": [
                     stage2
-                    for stage2 in [skip_stage(), limit_stage()]
+                    for stage2 in [
+                        skip_stage(page, page_size),
+                        limit_stage(page, page_size)
+                    ]
                     if stage2 != {}
                 ],
                 "total_count": [{"$count": "count"}],
             }
         },
-        {
-            '$project': {
-                'task_logs': 1,
-                'total_count': {
-                    '$first': '$total_count.count'
-                }
+        project({
+            'task_logs': 1,
+            'total_count': {
+                '$first': '$total_count.count'
             }
-        }
+        }),
     ])
     return (await log_result.to_list(1))[0]
 
 
-@app.get('/workflow_tasks')
+@app.get('/workflow_tasks', dependencies=[user_role])
 async def workflow_tasks(
     workflow_id: str,
     request: Request,
     page: Optional[int] = None,
     page_size: Optional[int] = None,
 ):
-
-    def skip_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$skip"] = page * (page_size if page_size > 0 else 1)
-        return stage
-
-    def limit_stage():
-        stage = {}
-        if page is not None and page_size is not None:
-            stage["$limit"] = page_size if page_size > 0 else 1
-        return stage
-
     log_result = request.state.database.tasks.aggregate([
-        {
-            '$project': {
-                '_id': 0,
-            }
-        },
-        {
-            '$match': {
-                'workflow_id': workflow_id
-            }
-        },
+        project({'_id': 0}),
+        match({'workflow_id': workflow_id}),
         {
             "$facet": {
                 "tasks": [
                     stage2
-                    for stage2 in [skip_stage(), limit_stage()]
+                    for stage2 in [
+                        skip_stage(page, page_size),
+                        limit_stage(page, page_size)
+                    ]
                     if stage2 != {}
                 ],
                 "total_count": [{"$count": "count"}],
             }
         },
-        {
-            '$project': {
-                'tasks': '$tasks.task',
-                'total_count': {
-                    '$first': '$total_count.count'
-                }
+        project({
+            'tasks': '$tasks.task',
+            'total_count': {
+                '$first': '$total_count.count'
             }
-        }
+        })
     ])
     return (await log_result.to_list(1))[0]
 
@@ -655,9 +632,7 @@ async def workflow_status(
     workflow_id: List[str] = Query([]),
 ):
     def match_stage():
-        stage = {
-            '$match': {}
-        }
+        stage = match({})
         if isinstance(workflow_id, str):
             stage["$match"]['workflow_id'] = workflow_id
         elif isinstance(workflow_id, list):
@@ -666,51 +641,28 @@ async def workflow_status(
             }
         return stage
     log_result = request.state.database.workflows.aggregate([
-        # {
-        #     '$project': {
-        #         '_id': 0,
-        #     }
-        # },
         match_stage(),
-        {
-            '$lookup': {
-                'from': 'workflow_status',
-                'localField': 'workflow_id',
-                'foreignField': 'workflow_id',
-                'as': 'workflow_status'
-            }
-        },
-        {
-            '$project': {
-                'status': { '$ifNull': [{'$first': "$workflow_status.status"}, 'Running'] },
-                'workflow_id': 1,
-                'workflow_status': 1,
-                '_id': 0
-            }
-        },
-        {
-            '$lookup': {
-                'from': 'tasks',
-                'localField': 'workflow_id',
-                'foreignField': 'workflow_id',
-                'as': 'tasks'
-            }
-        },
-        {
-            '$project': {
-                'status': '$status',
-                'workflow_id': 1,
-                'tasks.task.task_id': 1,
-            }
-        },
-        {
-            '$lookup': {
-            'from': 'task_status',
-            'localField': 'tasks.task.task_id',
-            'foreignField': 'task_id',
-            'as': 'task_status1',
-            }
-        },
+        lookup_workflow_status('workflow_id', 'workflow_status'),
+        project({
+            'status': {
+                '$ifNull': [
+                    {
+                        '$first': "$workflow_status.status"
+                    },
+                    'Running'
+                ]
+            },
+            'workflow_id': 1,
+            'workflow_status': 1,
+            '_id': 0
+        }),
+        lookup('tasks', 'workflow_id', 'workflow_id', 'tasks'),
+        project({
+            'status': '$status',
+            'workflow_id': 1,
+            'tasks.task.task_id': 1,
+        }),
+        lookup('task_status', 'tasks.task.task_id', 'task_id', 'task_status1'),
         {
             "$addFields": {
                 "tasks": {
@@ -724,7 +676,12 @@ async def workflow_status(
                                     '$first': {
                                         '$filter': {
                                             'input': "$task_status1",
-                                            'cond': { '$eq': ["$$this.task_id", "$$row.task.task_id"] }
+                                            'cond': {
+                                                '$eq': [
+                                                    "$$this.task_id",
+                                                    "$$row.task.task_id"
+                                                ]
+                                            }
                                         }
                                     }
                                 }
@@ -734,27 +691,30 @@ async def workflow_status(
                 }
             }
         },
-        {
-            '$project': {
-                'status': 1,
-                'workflow_id': 1,
-                'tasks': {
-                    "$map": {
-                        "input": "$tasks",
-                        "as": "row",
-                        "in": {
-                            "task_id": '$$row.task.task_id',
-                            "status": { '$ifNull': ["$$row.status", 'Running'] }
-                        }
+        project({
+            'status': 1,
+            'workflow_id': 1,
+            'tasks': {
+                "$map": {
+                    "input": "$tasks",
+                    "as": "row",
+                    "in": {
+                        "task_id": '$$row.task.task_id',
+                        "status": {'$ifNull': ["$$row.status", 'Running']}
                     }
                 }
             }
-        }
+        })
     ])
     return (await log_result.to_list(None))
 
 
-@app.post('/stop_workflow', dependencies=[Depends(RolesRequiredChecker(roles=["WORKFLOW_CONTROLLER"]))])
+@app.post(
+    '/stop_workflow',
+    dependencies=[
+        Depends(RolesRequiredChecker(roles=["WORKFLOW_CONTROLLER"]))
+    ]
+)
 async def stop_workflow(namespace: str, workflow_id: str, request: Request):
     request.state.redis_client.publish(
         namespace + '_' + task_control_channel_redis_key,
@@ -778,7 +738,12 @@ async def stop_workflow(namespace: str, workflow_id: str, request: Request):
     return 'OK'
 
 
-@app.post('/abort_workflow', dependencies=[Depends(RolesRequiredChecker(roles=["WORKFLOW_CONTROLLER"]))])
+@app.post(
+    '/abort_workflow',
+    dependencies=[
+        Depends(RolesRequiredChecker(roles=["WORKFLOW_CONTROLLER"]))
+    ]
+)
 async def abort_workflow(namespace: str, workflow_id: str, request: Request):
     request.state.redis_client.publish(
         namespace + '_' + task_control_channel_redis_key,
@@ -792,12 +757,20 @@ async def abort_workflow(namespace: str, workflow_id: str, request: Request):
             {'workflow_id': workflow_id, 'namespace': namespace}
         )
     ):
-        print('workflow_id: ' + workflow_id + ' found')
-        await workflow_status.insert_one({'workflow_id': workflow_id, 'namespace': namespace, 'status': 'Stopped'})
+        await workflow_status.insert_one({
+            'workflow_id': workflow_id,
+            'namespace': namespace,
+            'status': 'Stopped'
+        })
     return 'OK'
 
 
-@app.post('/stop_node', dependencies=[Depends(RolesRequiredChecker(roles=["NODE_ADMIN"]))])
+@app.post(
+    '/stop_node',
+    dependencies=[
+        Depends(RolesRequiredChecker(roles=["NODE_ADMIN"]))
+    ]
+)
 def stop_node(namespace: str, node_name: str, request: Request):
     request.state.redis_client.publish(
         namespace + '_' + 'node_control_channel',
@@ -806,3 +779,66 @@ def stop_node(namespace: str, node_name: str, request: Request):
             command='stop'
         ).to_json())
     return 'OK'
+
+
+@app.get('/node_metrics', dependencies=[user_role])
+async def node_metrics(namespace: str, request: Request):
+    registered_tasks = request.state.database.registered_tasks
+    if default_namespace(namespace):
+        registered_tasks_result = await registered_tasks.find({}).to_list(None)
+    else:
+        registered_tasks_result = await registered_tasks.find(
+            {'namespace': namespace}).to_list(None)
+    nodes = {}
+    for task in registered_tasks_result:
+        node_name = task['node_name']
+        node_namespace = task['namespace']
+        if node_name:
+            node_status = await node_active(node_name, node_namespace, request)
+            nodes[node_name] = node_status
+    return nodes
+
+
+@app.get('/workflow_metrics', dependencies=[])
+async def workflow_metrics(namespace: str, request: Request):
+    def match_stage():
+        stage = match({})
+        if not default_namespace(namespace):
+            stage['$match']['namespace'] = namespace
+        return stage
+    pipeline = [
+        match_stage(),
+        lookup_workflow_status('workflow_id', 'workflow_status'),
+        project({
+            'status': {
+                '$ifNull': [
+                    {
+                        '$first': "$workflow_status.status"
+                    },
+                    'Running'
+                ]
+            },
+            'workflow_id': 1,
+            'created_date': {
+                '$ifNull': [
+                    {
+                        '$toString': {
+                            '$last': "$workflow_status.created_date"
+                        },
+                    },
+                    {
+                        '$toString': "$created_date"
+                    }
+                ]
+            },
+            'namespace': 1,
+        }),
+        project({
+            '_id': 0,
+            'workflow_status._id': 0
+        })
+    ]
+    print(pipeline)
+    workflow_status_result2 = request.state.database.workflows.aggregate(
+        pipeline)
+    return await workflow_status_result2.to_list(None)
